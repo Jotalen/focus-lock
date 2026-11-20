@@ -1,0 +1,14 @@
+{
+  "manifest_version": 3,
+  "name": "Focus Lock — PIN Website Blocker",
+  "version": "1.0.0",
+  "description": "PIN-protected website blocking, built-in adult domain filtering, and approved YouTube videos.",
+  "minimum_chrome_version": "120",
+  "permissions": ["storage", "declarativeNetRequest", "webNavigation", "alarms", "tabs"],
+  "host_permissions": ["http://*/*", "https://*/*"],
+  "background": {"service_worker": "background.js", "type": "module"},
+  "action": {"default_title": "Open Focus Lock", "default_popup": "popup.html"},
+  "options_page": "options.html",
+  "content_scripts": [{"matches": ["http://*/*", "https://*/*"], "js": ["guard.js"], "run_at": "document_start", "all_frames": true}],
+  "web_accessible_resources": [{"resources": ["blocked.html", "blocked.js", "style.css", "ui.js"], "matches": ["http://*/*", "https://*/*"]}]
+}
