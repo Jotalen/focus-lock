@@ -4,10 +4,10 @@ import fs from 'node:fs/promises';
 function area() { const data = {}; return {data, async get(key) { if (key === null) return {...data}; if (typeof key === 'string') return {[key]:data[key]}; return {}; }, async set(items) { Object.assign(data,structuredClone(items)); }, async remove(key) { delete data[key]; }, async setAccessLevel(opts) { this.level = opts.accessLevel; }}; }
 function event() { return {listeners: [], addListener(fn) { this.listeners.push(fn); }}; }
 test('service worker enforces authentication, rules, rate limits and expiry', async () => {
- const local = area(), session = area(), dynamic = [], rules = [];
+ const local = area(), session = area(), dynamic = [{id: 100, condition: {regexFilter: 'old-video-regex'}}], rules = [], tabs = [], updates = [], notifications = [];
  const runtime = {id:'test',getURL:p=>'chrome-extension://test/'+p,onMessage:event(),onInstalled:event(),onStartup:event()};
  const alarms = {onAlarm:event(),async create(){}, async clear(){}};
- globalThis.chrome = {runtime,storage:{local,session},alarms,action:{onClicked:event()},tabs:{async query(){return []},async update(){}},webNavigation:{onCommitted:event(),onHistoryStateUpdated:event(),onReferenceFragmentUpdated:event()},declarativeNetRequest:{async getDynamicRules(){return [...dynamic]},async getSessionRules(){return [...rules]},async updateDynamicRules({addRules}){dynamic.splice(0,dynamic.length,...addRules)},async updateSessionRules({addRules}){rules.splice(0,rules.length,...addRules)}}};
+ globalThis.chrome = {runtime,storage:{local,session},alarms,action:{onClicked:event()},tabs:{async query(){return tabs},async get(id){return tabs.find(t => t.id === id)},async update(id, value){updates.push({id,...value}); Object.assign(tabs.find(t => t.id === id),value)},async sendMessage(id, message){notifications.push({id,...message})}},webNavigation:{onCommitted:event(),onHistoryStateUpdated:event(),onReferenceFragmentUpdated:event()},declarativeNetRequest:{async getDynamicRules(){return [...dynamic]},async getSessionRules(){return [...rules]},async updateDynamicRules({addRules}){dynamic.splice(0,dynamic.length,...addRules)},async updateSessionRules({addRules}){rules.splice(0,rules.length,...addRules)}}};
  const oldFetch = globalThis.fetch;
  globalThis.fetch = async () => ({async json(){ return JSON.parse(await fs.readFile(new URL('../adult-domains.json',import.meta.url),'utf8')); }});
  await import('../background.js');
@@ -24,7 +24,9 @@ test('service worker enforces authentication, rules, rate limits and expiry', as
  assert.equal((await call('domainAdd',{value:'youtube.com'})).data.ok,true);
  assert.equal((await call('domainAdd',{value:'example.com'})).data.ok,true);
  assert.equal((await call('videoAdd',{value:'dQw4w9WgXcQ',title:'Lesson'})).data.ok,true);
- assert.equal(dynamic.length,3);
+ assert.equal(dynamic.length,2);
+ assert.ok(dynamic.every(r => !r.condition.requestDomains.includes('youtube.com')));
+ assert.ok(!dynamic.some(r => r.id === 100));
  assert.equal(local.data.state.credential.hash.length,64);
  assert.ok(!JSON.stringify((await call('get')).data).includes('hash'));
  assert.match((await call('domainRemove',{value:'youtube.com'},blocked)).error,/Permission denied/);
@@ -32,6 +34,27 @@ test('service worker enforces authentication, rules, rate limits and expiry', as
  assert.match((await call('login',{pin:'1234'},web)).error,/Permission denied/);
  assert.equal((await call('check',{url:'https://youtube.com/watch?v=dQw4w9WgXcQ'},web)).data.blocked,false);
  assert.equal((await call('check',{url:'https://youtube.com/watch?v=aaaaaaaaaaa'},web)).data.blocked,true);
+ assert.equal((await call('check',{url:'https://youtube.com/results?search_query=lesson'},web)).data.blocked,false);
+ assert.equal((await call('check',{url:'https://youtube.com/'},web)).data.playbackAllowed,false);
+ tabs.push({id:42,url:'https://youtube.com/results?search_query=lesson'});
+ assert.equal((await call('videoAdd',{value:'https://www.youtube.com/watch?v=FLDx2MFEkdU'})).data.ok,true);
+ assert.ok(notifications.some(n => n.id === 42 && n.type === 'recheck'));
+ assert.equal(updates.length,0);
+ tabs[0].url='https://youtube.com/watch?v=FLDx2MFEkdU';
+ assert.equal((await call('videoRemove',{value:'FLDx2MFEkdU'})).data.ok,true);
+ assert.ok(updates.at(-1).url.startsWith(runtime.getURL('blocked.html')));
+ tabs[0].url='https://youtube.com/watch?v=dQw4w9WgXcQ';
+ const before=updates.length;
+ chrome.webNavigation.onHistoryStateUpdated.listeners[0]({frameId:0,tabId:42,url:'https://youtube.com/watch?v=aaaaaaaaaaa'});
+ await call('status');
+ assert.equal(updates.length,before,'stale blocked route must not replace a newer approved route');
+ const ytBlocked={...blocked,url:runtime.getURL('blocked.html')+'#https://youtube.com/watch?v=aaaaaaaaaaa'};
+ assert.equal((await call('unlock',{pin:'1234',url:'https://youtube.com/watch?v=aaaaaaaaaaa'},ytBlocked)).data.ok,true);
+ assert.equal((await call('check',{url:'https://youtu.be/aaaaaaaaaaa'},web)).data.blocked,false);
+ await call('revoke');
+ assert.equal((await call('check',{url:'https://youtube.com/watch?v=aaaaaaaaaaa'},web)).data.blocked,true);
+ tabs.length=0;
+
  assert.equal((await call('unlock',{pin:'1234',url:'https://example.com/path'},blocked)).data.ok,true);
  assert.equal(rules.length,1);
  assert.ok(session.data.grants['example.com'] > Date.now());

@@ -1,4 +1,4 @@
-import { normalizeDomain, videoId, blockedDomain, buildRules, derivePin } from './core.js';
+import { normalizeDomain, videoId, blockedDomain, pagePolicy, buildRules, derivePin } from './core.js';
 let adult = [];
 const adultReady = fetch(chrome.runtime.getURL('adult-domains.json')).then(r => r.json()).then(domains => { adult = domains; });
 const blank = () => ({domains: [], videos: [], credential: null});
@@ -18,11 +18,18 @@ async function syncRules(s) {
   if (active.length) await chrome.alarms.create('expiry', {when: Math.min(...active.map(([, t]) => t))});
 }
 async function enforceTab(tabId, url, s, grants) {
-  if (blockedDomain(url, s, adult, grants)) await chrome.tabs.update(tabId, {url: chrome.runtime.getURL('blocked.html') + '#' + url}).catch(() => {});
+  if (!blockedDomain(url, s, adult, grants)) return;
+  // A queued navigation check must not replace a newer, allowed destination.
+  const tab = await chrome.tabs.get(tabId).catch(() => null);
+  if (tab && (tab.pendingUrl || tab.url) === url) await chrome.tabs.update(tabId, {url: chrome.runtime.getURL('blocked.html') + '#' + url}).catch(() => {});
 }
 async function enforceAll() {
   const s = await state(), {grants} = await session();
-  await Promise.all((await chrome.tabs.query({})).map(t => enforceTab(t.id, t.url, s, grants)));
+  await Promise.all((await chrome.tabs.query({})).map(async t => {
+    await enforceTab(t.id, t.pendingUrl || t.url, s, grants);
+    // Also refresh preview/playback decisions in existing pages and frames.
+    await chrome.tabs.sendMessage(t.id, {type: 'recheck'}).catch(() => {});
+  }));
 }
 async function verify(pin) {
   const s = await state();
@@ -45,7 +52,8 @@ async function handle(m, sender) {
     const s = await state(), {grants} = await session();
     const url = m.url || sender.url;
     // Content scripts can request a read-only decision only.
-    return {blocked: !!blockedDomain(url, s, adult, grants), blockedPage: chrome.runtime.getURL('blocked.html')};
+    const policy = pagePolicy(url, s, adult, grants);
+    return {blocked: !!policy.blockedDomain, playbackAllowed: policy.playbackAllowed, blockedPage: chrome.runtime.getURL('blocked.html')};
   }
   assertPage(sender, ['options.html', 'blocked.html', 'popup.html']);
   const s = await state(), sess = await session();

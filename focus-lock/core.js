@@ -8,47 +8,69 @@ export function normalizeDomain(input) {
   return host;
 }
 export const matchesDomain = (host, domain) => host === domain || host.endsWith(`.${domain}`);
+const youtubeDomains = ['youtube.com', 'youtu.be', 'youtube-nocookie.com'];
+export const isYouTubeHost = host => youtubeDomains.some(d => matchesDomain(host.toLowerCase().replace(/\.$/, ''), d));
+// Blocking youtube.com also covers its short links and privacy-enhanced embeds.
+const domainApplies = (host, domain) => matchesDomain(host, domain) || domain === 'youtube.com' && isYouTubeHost(host);
+function parsedVideoId(u) {
+  const host = u.hostname.toLowerCase().replace(/\.$/, '');
+  if (!isYouTubeHost(host)) return null;
+  const path = decodeURIComponent(u.pathname);
+  let id;
+  if (matchesDomain(host, 'youtu.be')) id = path.match(/^\/([\w-]{11})\/?$/)?.[1];
+  else if (/^\/(?:watch|watch_popup)\/?$/.test(path)) {
+    // URLSearchParams also catches duplicate encoded keys such as %76.
+    if (u.searchParams.getAll('v').length === 1) id = u.searchParams.get('v');
+  } else id = path.match(/^\/(?:shorts|embed|live|v|e)\/([\w-]{11})\/?$/)?.[1];
+  return /^[\w-]{11}$/.test(id || '') ? id : null;
+}
+function isVideoPage(u) {
+  const path = decodeURIComponent(u.pathname);
+  if (matchesDomain(u.hostname.replace(/\.$/, ''), 'youtu.be')) return path !== '/';
+  // Malformed video destinations are blocked too, rather than treated as browsing.
+  return /^\/(?:watch|watch_popup|shorts|embed|live|v|e)(?:\/|$)/.test(path);
+}
 export function videoId(value) {
   const raw = String(value || '').trim();
   if (/^[\w-]{11}$/.test(raw)) return raw;
   let u; try { u = new URL(raw); } catch { throw Error('Paste a YouTube video URL or its 11-character ID.'); }
   if (!['http:', 'https:'].includes(u.protocol) || u.username || u.password || u.port) throw Error('Invalid YouTube URL.');
-  const host = u.hostname.toLowerCase();
-  let id;
-  if (host === 'youtu.be') id = u.pathname.slice(1);
-  else if (['youtube.com', 'www.youtube.com', 'm.youtube.com'].includes(host)) {
-    if (u.pathname === '/watch' && u.searchParams.getAll('v').length === 1) id = u.searchParams.get('v');
-    else id = u.pathname.match(/^\/(?:shorts|embed|live)\/([\w-]{11})\/?$/)?.[1];
-  }
-  if (!/^[\w-]{11}$/.test(id || '')) throw Error('Use a specific YouTube video, not a channel or playlist.');
+  let id; try { id = parsedVideoId(u); } catch { /* Invalid encoded path. */ }
+  if (!id) throw Error('Use a specific YouTube video, not a channel or playlist.');
   return id;
-}
-export function videoPattern(id) {
-  // RE2-compatible: disallow a second v key, including encoded parameter names.
-  const other = '([a-uw-zA-Z0-9_.~-][a-zA-Z0-9_.~-]*|v[a-zA-Z0-9_.~-]+)(=[^&#]*)?';
-  return `^https?://(www\\.|m\\.)?youtube\\.com/watch\\?(${other}&)*v=${id}(&${other})*(#.*)?$`;
 }
 export function isApprovedVideo(url, videos) {
   try {
-    const u = new URL(url);
-    // Only canonical watch pages are allowed; pasted links are normalized to these.
-    return ['youtube.com', 'www.youtube.com', 'm.youtube.com'].includes(u.hostname) && u.pathname === '/watch' && u.searchParams.getAll('v').length === 1 && videos.some(v => new RegExp(videoPattern(v.id)).test(url));
+    const id = videoId(url);
+    return videos.some(v => v.id === id);
   } catch { return false; }
 }
-export function blockedDomain(url, state, adult, grants = {}, now = Date.now()) {
-  let u; try { u = new URL(url); } catch { return null; }
-  if (!['http:', 'https:'].includes(u.protocol)) return null;
+export function pagePolicy(url, state, adult, grants = {}, now = Date.now()) {
+  const allowed = {blockedDomain: null, playbackAllowed: true};
+  let u; try { u = new URL(url); } catch { return allowed; }
+  if (!['http:', 'https:'].includes(u.protocol)) return allowed;
   const host = u.hostname.toLowerCase().replace(/\.$/, '');
-  if (Object.entries(grants).some(([d, until]) => until > now && matchesDomain(host, d))) return null;
-  const domain = [...state.domains, ...adult].find(d => matchesDomain(host, d));
-  if (!domain) return null;
-  if (isApprovedVideo(url, state.videos)) return null;
-  return domain;
+  if (Object.entries(grants).some(([d, until]) => until > now && domainApplies(host, d))) return allowed;
+  const domain = [...state.domains, ...adult].find(d => domainApplies(host, d));
+  if (!domain) return allowed;
+  if (isYouTubeHost(host)) {
+    if (isApprovedVideo(url, state.videos)) return allowed;
+    try {
+      // Search, channels, playlists and the homepage stay usable. Pause previews
+      // and the miniplayer there so browsing cannot play unapproved videos.
+      if (!isVideoPage(u)) return {blockedDomain: null, playbackAllowed: false};
+    } catch { /* Invalid encoded playback paths stay blocked. */ }
+  }
+  return {blockedDomain: domain, playbackAllowed: false};
+}
+export function blockedDomain(url, state, adult, grants = {}, now = Date.now()) {
+  return pagePolicy(url, state, adult, grants, now).blockedDomain;
 }
 export function buildRules(state, adult, blockedPage) {
-  const domains = [...new Set([...adult, ...state.domains])];
+  // YouTube is checked by URL in the worker and page guard, never by a per-video
+  // DNR regex. Keeping it out also lets browser/search/channel pages load.
+  const domains = [...new Set([...adult, ...state.domains])].filter(d => !isYouTubeHost(d));
   const rules = domains.length ? [{id: 1, priority: 1, action: {type: 'redirect', redirect: {regexSubstitution: `${blockedPage}#\\0`}}, condition: {requestDomains: domains, regexFilter: '^https?://.*', resourceTypes: ['main_frame']}}, {id: 2, priority: 1, action: {type: 'block'}, condition: {requestDomains: domains, resourceTypes: ['sub_frame']}}] : [];
-  state.videos.forEach((v, i) => rules.push({id: 100 + i, priority: 10, action: {type: 'allow'}, condition: {regexFilter: videoPattern(v.id), isUrlFilterCaseSensitive: true, resourceTypes: ['main_frame']}}));
   return rules;
 }
 export async function derivePin(pin, salt) {
